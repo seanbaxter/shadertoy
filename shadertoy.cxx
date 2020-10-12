@@ -7,10 +7,16 @@
 #include <GLFW/glfw3.h>
 #include <cstdio>
 #include <cstdlib>
+#include <complex>
 
 namespace imgui {
   // imgui attribute tags.
-  using color [[attribute]] = void;
+  using color  [[attribute]] = void;
+  using checkbox [[attribute]] = void;
+
+  // Center and size of render area.
+  // using center [[attribute]] = void;
+  // using area   [[attribute]] = void;
 
   template<typename type_t>
   struct minmax_t {
@@ -30,13 +36,16 @@ void vert_main() {
 [[using spirv: out, location(0)]]
 vec4 fragColor;
 
-enum uniform_location_t {
-  uniform_location_resolution,
-
+enum class uniform_location_t {
+  resolution,
+  time,
 };
 
-[[using spirv: uniform, location(0)]]
+[[using spirv: uniform, location((int)uniform_location_t::resolution)]]
 vec2 iResolution;
+
+[[using spirv: uniform, location((int)uniform_location_t::time)]]
+float iTime;
 
 template<typename shader_t>
 [[using spirv: uniform, binding(0)]]
@@ -145,7 +154,9 @@ void app_t::loop(program_base_t& program) {
     glBindVertexArray(vao);
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glUniform2f(uniform_location_resolution, width, height);
+    glUniform2f((int)uniform_location_t::resolution, width, height);
+
+    glUniform1f((int)uniform_location_t::time, glfwGetTime());
 
     // Render the ImGui frame over the application.
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -196,20 +207,25 @@ void program_t<shader_t>::configure() {
 
   using namespace imgui;
   @meta for(int i = 0; i < @member_count(shader_t); ++i) {{
+    typedef @member_type(shader_t, i) type_t;
+    const char* name = @member_name(shader_t, i);
+    auto& value = @member_value(shader, i);
+
     if constexpr(@member_has_attribute(shader_t, i, color)) {
-      ImGui::ColorEdit4(
-        @member_name(shader_t, i), 
-        &@member_value(shader, i).x
-      );
+      ImGui::ColorEdit4(name, &value.x);
 
     } else if constexpr(@member_has_attribute(shader_t, i, slider_float)) {
       auto minmax = @member_attribute(shader_t, i, slider_float);
-      ImGui::SliderFloat(
-        @member_name(shader_t, i),
-        &@member_value(shader, i),
-        minmax.min,
-        minmax.max
-      );
+      ImGui::SliderFloat(name, &value, minmax.min, minmax.max);
+
+    } else if constexpr(@member_has_attribute(shader_t, i, checkbox)) {
+      ImGui::Checkbox(name, (bool*)&value);
+
+    } else if constexpr(std::is_same_v<type_t, vec2>) {
+      ImGui::DragFloat2(name, &value.x, .1f);
+      
+    } else if constexpr(std::is_same_v<type_t, float>) {
+      ImGui::DragFloat(name, &value, .1f);
     }
   }}
 
@@ -223,21 +239,182 @@ void program_t<shader_t>::configure() {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct fire_t {
+inline vec2 rot(vec2 p, vec2 pivot, float a) {
+  p -= pivot;
+  p = vec2(
+    p.x * cos(a) - p.y * sin(a), 
+    p.x * sin(a) + p.y * cos(a)
+  );
+  p += pivot;
+
+  return p;
+}
+
+inline vec2 rot(vec2 p, float a) {
+  return rot(p, vec2(), a);
+}
+
+
+#if 0
+struct mandelbrot_t {
+
+
+  vec3 sine_color(float x) {
+    return sin(vec3(.3, .45, .65) * x) * .5f + .5f;
+  }
+
   // Run the shader.
   vec4 render(vec2 frag_coord) {
+    // Normalize the area to the interval (0, 1)
+    vec2 uv = frag_coord / iResolution;
 
-    // Normalized pixel coordinates between -.5 and +.5.
-    vec2 uv = (frag_coord - iResolution / 2) / iResolution;
-    float r2 = dot(uv, uv);
+    // Make the x dimension equal to scale. Make y res.y / res.x * scale.
+    uv = (uv - .5f) * scale;
+    uv.y *= iResolution.y / iResolution.x;
 
-    return r2 < radius * radius ? color_inner : color_outer;
+    uv += center;
+    uv = rot(uv, center, angle);
+
+    std::complex<float> z(uv.x, uv.y), c { };
+    int iter;
+    for(iter = 0; iter < 255; ++iter) {
+      c = c * c + z;
+      if(std::norm(c) > 4)
+        break;
+    }
+
+    return vec4(sine_color(20 * sqrt(iter / 255.f)), 1);
   }
 
   // Data members with initializers.
+   vec2  center      = vec2(-1, 0);
+  float  scale                  = 3;
+  [[.imgui::slider_float{-M_PI, M_PI}]] float angle = 0;
   [[.imgui::color]]              vec4  color_inner = vec4(1, 0, 0, 1);
   [[.imgui::color]]              vec4  color_outer = vec4(0, 1, 0, 1);
   [[.imgui::slider_float{0, 1}]] float radius      = .25f;
+};
+#endif 
+
+struct modulation_t {
+  // TODO: Import into spirv.cxx.
+  float mod(float x, float y) {
+    return x - y * floor(x / y);
+  }
+
+  // Signed distance to a n-star polygon with external angle en.
+  float sdStar(vec2 p, float r, int n, float m) {
+    float an = M_PIf32 / n;
+    float en = M_PIf32 / m;
+    vec2 acs(cos(an), sin(an));
+    vec2 ecs(cos(en), sin(en));
+
+    // reduce to first sector.
+    float bn = mod(atan2(p.x, p.y), 2 * an) - an;
+    p = length(p) * vec2(cos(bn), abs(sin(bn)));
+
+    // line sdf
+    p -= r * acs;
+    p += ecs * clamp(-dot(p, ecs), 0.0f, r * acs.y / ecs.y);
+    return length(p) * sign(p.x);
+  }
+
+  float sdShape(vec2 uv) {
+    float angle = -iTime * StarRotationSpeed;
+    return sdStar(rot(uv, angle), StarSize, StarPoints, StarWeight);
+  }
+
+  vec3 dtoa(float d, vec3 amount) {
+    return 1 / clamp(d * amount, 1, amount);
+  }
+
+  // https://www.shadertoy.com/view/3t23WG
+  // Distance to y(x) = a + b*cos(cx+d)
+  float udCos(vec2 p, float a, float b, float c, float d) {
+    p = c * (p - vec2(d, a));
+    
+    // Reduce to principal half cyc
+    p.x = mod(p.x, 2 * M_PIf32);
+    if(p.x > M_PIf32)
+      p.x = 2 * M_PIf32 - p.x;
+
+    // Fine zero of derivative (minimize distance).
+    float xa = 0, xb = 2 * M_PIf32;
+    for(int i = 0; i < 7; ++i) { // bisection, 7 bits more or less.
+      float  x = .5f * (xa + xb);
+      float si = sin(x);
+      float co = cos(x);
+      float  y = x - p.x + b * c * si * (p.y - b * c * co);
+      if(y < 0)
+        xa = x;
+      else
+        xb = x;
+    }
+
+    float x = .5f * (xa + xb);
+    for(int i = 0; i < 4; ++i) { // Newton-Raphson, 28 bits more or less.
+      float si = sin(x);
+      float co = cos(x);
+      float  f = x - p.x + b * c * (p.y * si - b * c * si * co);
+      float df = 1       + b * c * (p.y * co - b * c * (2 * co * co - 1));
+      x = x - f / df;
+    }
+
+    // Compute distance.
+    vec2 q(x, b * c * cos(x));
+    return length(p - q) / c;
+  }
+
+  vec4 render(vec2 frag_coord) {
+    vec2 N = frag_coord / iResolution - .5f;
+    vec2 uv = N;
+    uv.x *= iResolution.x / iResolution.y;
+
+    uv *= Zoom;
+    float t = iTime * PhaseSpeed;
+
+    vec2 uvsq = uv;
+    float a = sdShape(uv);
+
+    float sh = mix(100.f, 1000.f, Sharpness);
+
+    float a2 = 1.5;
+    for(int i = -3; i <= 3; ++i) {
+      vec2 uvwave(uv.x, uv.y + i * WaveSpacing);
+      float b = smoothstep(1.f, -1.f, a) * WaveAmp + WaveAmpOffset;
+      a2 = min(a2, udCos(uvwave, 0.f, b, WaveFreq, t));
+    }
+
+    vec3 o = dtoa(mix(a2, a-LineWeight + 4, .03f), sh * Tint);
+    if(!InvertColors)
+      o = 1 - o;
+
+    o *= 1 - dot(N, N * 2);
+    return vec4(clamp(o, 0, 1), 1);
+  }
+
+                       float Zoom = 3;
+                       float LineWeight = 4.3;
+
+                       // TODO: Support bool in spirv.c
+  [[.imgui::checkbox]] char InvertColors = true;   
+
+                       float Sharpness = .2;
+                     
+                       float StarRotationSpeed = -.5;
+                       float StarSize = 1.8;
+                       int StarPoints = 3;
+                       float StarWeight = 4;
+                     
+                       float WaveSpacing = .3;
+                       float WaveAmp = .4;
+                       float WaveFreq = 25;
+                       float PhaseSpeed = .33;
+                     
+                       float WaveAmpOffset = .01;
+
+  [[.imgui::color]] vec3 Tint = vec3(1, .5, .4);
+
 };
 
 int main() {
@@ -246,8 +423,8 @@ int main() {
   
   app_t app;
 
-  program_t<fire_t> fire;
-  app.loop(fire);
+  program_t<modulation_t> modulation;
+  app.loop(modulation);
 
   return 0;
 }
